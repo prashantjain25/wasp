@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""
+wasp - architecture: Facade > Strategy/Adapter > Proxy > MCP.
+"""
+
+import base64, datetime, json, os, subprocess, sys, threading, time, urllib.request
+from abc import ABC, abstractmethod
+from argparse import ArgumentParser
+from typing import Dict, List, Optional, Tuple
+
+from menu import pick
+
+# ═══════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════
+
+CONFIG_FILE   = os.path.expanduser("~/.llm_config.json")
+STATE_FILE    = os.path.expanduser("~/.llm_state.json")
+MCP_CONFIG    = os.path.expanduser("~/.mcp.json")
+LOG_FILE = os.path.expanduser("~/wasp/wasp.log")
+LOG_ENABLED   = True
+
+MCP_TOOL_TIMEOUT = 90
+BACKEND_POLLS    = 60
+
+# ═══════════════════════════════════════════════
+# Logger (simple file-based)
+# ═══════════════════════════════════════════════
+
+def log(msg: str, data: str = "") -> None:
+    if not LOG_ENABLED: return
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:12]
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{ts}] {msg}")
+        if data: f.write(f" {data[:200]}")
+        f.write("\n")
+
+# ═══════════════════════════════════════════════
+# Secrets
+# ═══════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════
+# State
+# ═══════════════════════════════════════════════
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f: return json.load(f)
+    except: return {}
+
+def save_state(**kw) -> None:
+    s = load_state()
+    s.update(kw)
+    with open(STATE_FILE, "w") as f: json.dump(s, f)
+
+# ═══════════════════════════════════════════════
+# Config
+# ═══════════════════════════════════════════════
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f: return json.load(f)
+    except: return {"providers": {}}
+
+def provider_cfg(name: str) -> dict:
+    return load_config().get("providers", {}).get(name, {})
+
+def provider_names() -> List[str]:
+    return list(load_config().get("providers", {}).keys())
+
+# ══════════════════════════════════════════════════════════
+# Strategy + Adapter — ProviderAdapter hierarchy
+# ══════════════════════════════════════════════════════════
+
+def _stream_response(resp, adapter):
+    """Parse streaming response lines into text."""
+    content = ""
+    for raw in resp:
+        line = raw.decode().strip() if isinstance(raw, bytes) else raw.strip()
+        if not line: continue
+        if adapter.is_stream_sse():
+            if line.startswith("data: "): line = line[6:]
+            if line == "[DONE]": break
+        try:
+            token = adapter.parse_chunk(json.loads(line))
+            if token:
+                content += token
+                print(token, end="", flush=True)
+        except json.JSONDecodeError:
+            log("PARSE", line[:100])
+    return content
+
+class ProviderAdapter(ABC):
+    """Strategy interface: every backend must implement these."""
+
+    def __init__(self, name: str, cfg: dict) -> None:
+        self.name = name
+        self.cfg = cfg
+        self.base = cfg.get("base_url", "").rstrip("/")
+
+    @abstractmethod
+    def models_path(self) -> str: ...
+    @abstractmethod
+    def chat_path(self) -> str: ...
+    @abstractmethod
+    def parse_model_list(self, raw: dict) -> List[str]: ...
+    @abstractmethod
+    def parse_chunk(self, chunk: dict) -> str: ...
+    def is_stream_sse(self) -> bool: return False
+    def default_model(self) -> str: return self.cfg.get("default_model", "default")
+
+    # ── Shared ─────────────────────────────────────────────────────────────
+
+    def url(self, path: str) -> str:
+        return self.base + "/" + path.lstrip("/")
+
+    def is_running(self) -> bool:
+        try:
+            urllib.request.urlopen(urllib.request.Request(self.url(self.models_path())), timeout=2)
+            return True
+        except: return False
+
+    def live_models(self) -> List[str]:
+        try:
+            req = urllib.request.Request(self.url(self.models_path()),
+                                         headers={"Content-Type": "application/json"})
+            data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+            return self.parse_model_list(data)
+        except:
+            return [m["id"] for m in self.cfg.get("models", [])]
+
+    def configured_model_names(self) -> List[str]:
+        return [m.get("name", m["id"]) for m in self.cfg.get("models", [])]
+
+    def chat(self, messages: List[dict], model: str = "") -> str:
+        """Stream a chat response. Returns the full response text."""
+        if not model:
+            models = self.live_models()
+            model = models[0] if models else self.default_model()
+
+        payload = {"model": model, "messages": messages, "stream": True}
+        # Only Ollama backend uses options; OpenAI-compatible ignores them
+        opts = self.cfg.get("options", {})
+        if opts and not self.is_stream_sse():
+            payload["options"] = opts
+
+        log(f"CHAT {self.name}@{model}",
+            json.dumps([{"role": m["role"], "content": (m.get("content","") or "")[:60]}
+                       for m in messages]))
+
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            self.url(self.chat_path()), data=body,
+            headers={"Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=120)
+
+        content = _stream_response(resp, self)
+
+        print()
+        log(f"RESP ({len(content)}c)", content[:100])
+        return content
+
+    def start(self) -> str:
+        if self.is_running(): return f"  {self.name} already running"
+        cmd = self.cfg.get("start_cmd", "")
+        if not cmd: return f"  No start_cmd for {self.name}"
+        log(f"START {self.name}")
+        os.system(cmd + " 2>/dev/null")
+        for _ in range(BACKEND_POLLS):
+            time.sleep(0.5)
+            if self.is_running():
+                log(f"START {self.name} OK")
+                return f"  {self.name} started"
+        return f"  {self.name} start timed out"
+
+    def stop(self) -> str:
+        if not self.is_running(): return f"  {self.name} not running"
+        cmd = self.cfg.get("stop_cmd", "")
+        if not cmd: return f"  No stop_cmd for {self.name}"
+        log(f"STOP {self.name}")
+        os.system(cmd + " 2>/dev/null")
+        time.sleep(1)
+        return f"  {self.name} stopped" if not self.is_running() else f"  Failed to stop {self.name}"
+
+
+class OllamaAdapter(ProviderAdapter):
+    """Native Ollama HTTP API."""
+
+    def models_path(self) -> str: return "/api/tags"
+    def chat_path(self) -> str: return "/api/chat"
+    def is_stream_sse(self) -> bool: return False
+
+    def parse_model_list(self, raw: dict) -> List[str]:
+        return [m["name"] for m in raw.get("models", [])]
+
+    def parse_chunk(self, chunk: dict) -> str:
+        return chunk.get("message", {}).get("content", "")
+
+
+class OpenAiAdapter(ProviderAdapter):
+    """OpenAI-compatible API (used by LlamaFile, Crush providers, etc.)."""
+
+    def models_path(self) -> str: return "/v1/models"
+    def chat_path(self) -> str: return "/v1/chat/completions"
+    def is_stream_sse(self) -> bool: return True
+
+    def parse_model_list(self, raw: dict) -> List[str]:
+        ids = [m["id"] for m in raw.get("data", [])]
+        return [i.split("/")[-1].replace(".gguf", "") for i in ids]
+
+    def parse_chunk(self, chunk: dict) -> str:
+        return chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+
+
+# ═══════════════════════════════════════════════
+# Proxy — LoggingProxy wraps any adapter
+# ═══════════════════════════════════════════════
+
+class LoggingProxy(ProviderAdapter):
+    """Wraps a ProviderAdapter, logging all calls via the outer log() function."""
+
+    def __init__(self, inner: ProviderAdapter) -> None:
+        self._inner = inner
+        super().__init__(inner.name, inner.cfg)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def models_path(self) -> str: return self._inner.models_path()
+    def chat_path(self) -> str: return self._inner.chat_path()
+    def is_stream_sse(self) -> bool: return self._inner.is_stream_sse()
+    def parse_model_list(self, raw: dict) -> List[str]: return self._inner.parse_model_list(raw)
+    def parse_chunk(self, chunk: dict) -> str: return self._inner.parse_chunk(chunk)
+    def default_model(self) -> str: return self._inner.default_model()
+
+
+# ═══════════════════════════════════════════════
+# Factory — creates the right adapter per provider
+# ═══════════════════════════════════════════════
+
+# Future cloud/internet LLM providers register here:
+#   "openai-api": OpenAiCloudAdapter,   # OpenAI API (requires API key)
+#   "anthropic": AnthropicAdapter,      # Anthropic/Claude API
+# Each adapter extends ProviderAdapter with cloud-specific auth/retry.
+ADAPTER_TYPES = {
+    "ollama": OllamaAdapter,
+    "openai": OpenAiAdapter,
+}
+
+def create_provider(name: str) -> Optional[ProviderAdapter]:
+    """Factory: build an adapter for the named provider, wrapped in LoggingProxy."""
+    cfg = provider_cfg(name)
+    if not cfg:
+        return None
+    ptype = cfg.get("type", "ollama")
+    cls = ADAPTER_TYPES.get(ptype)
+    if not cls:
+        log(f"UNKNOWN TYPE {ptype}", name)
+        return None
+    raw = cls(name, cfg)
+    return LoggingProxy(raw)
+
+def all_adapters() -> Dict[str, ProviderAdapter]:
+    return {n: create_provider(n) for n in provider_names() if create_provider(n)}
+
+def active_adapter() -> Optional[ProviderAdapter]:
+    s = load_state()
+    bk = s.get("backend", "")
+    if bk not in provider_names():
+        bk = provider_names()[0] if provider_names() else ""
+    return create_provider(bk)
+
+# ═══════════════════════════════════════════════
+# MCP Client (JSON-RPC over stdio)
+# ═══════════════════════════════════════════════
+
+class McpClient:
+    def __init__(self, cfg: dict) -> None:
+        self.cfg, self.proc, self.rid = cfg, None, 0
+        self.pending: Dict[int, list] = {}
+
+    def start(self) -> None:
+        cmd = [self.cfg["command"]] + self.cfg.get("args", [])
+        env = os.environ.copy(); env.update(self.cfg.get("env", {}))
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, env=env, text=True)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self) -> None:
+        while self.proc and self.proc.stdout:
+            line = self.proc.stdout.readline()
+            if not line: break
+            try:
+                m = json.loads(line.strip())
+                rid = m.get("id")
+                if rid and rid in self.pending:
+                    self.pending[rid].append(m)
+            except: pass
+
+    def _send(self, method: str, params: dict = None) -> int:
+        self.rid += 1
+        req = {"jsonrpc": "2.0", "id": self.rid, "method": method, "params": params or {}}
+        self.pending[self.rid] = []
+        if self.proc and self.proc.stdin:
+            self.proc.stdin.write(json.dumps(req) + "\n")
+            self.proc.stdin.flush()
+        return self.rid
+
+    def _wait(self, rid: int, timeout: int = 60) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if rid in self.pending and self.pending[rid]:
+                for r in reversed(self.pending[rid]):
+                    if "result" in r or "error" in r:
+                        self.pending.pop(rid, None); return r
+            time.sleep(0.05)
+        self.pending.pop(rid, None)
+        return {"error": {"message": "timeout"}}
+
+    def initialize(self) -> None:
+        self.start(); time.sleep(0.5)
+        rid = self._send("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                        "clientInfo": {"name":"wasp","version":"1.0"}})
+        self._wait(rid, 15)
+        self._send("notifications/initialized")
+
+    def list_tools(self) -> list:
+        r = self._wait(self._send("tools/list"), 15)
+        return r.get("result", {}).get("tools", []) if "result" in r else []
+
+    def call_tool(self, name: str, args: dict) -> list:
+        r = self._wait(self._send("tools/call", {"name": name, "arguments": args}), MCP_TOOL_TIMEOUT)
+        if "result" in r: return r["result"].get("content", [])
+        return [{"type": "text", "text": f"Error: {r.get('error',{}).get('message','?')}"}]
+
+    def close(self) -> None:
+        if not self.proc: return
+        try:
+            self._send("shutdown"); self.proc.terminate(); self.proc.wait(3)
+        except: self.proc.kill()
+
+
+def init_mcp() -> Tuple[Optional[dict], List[str]]:
+    try:
+        with open(MCP_CONFIG) as f: servers = json.load(f).get("mcpServers", {})
+    except: return None, []
+    clients, all_names = {}, []
+    for name, cfg in servers.items():
+        if cfg.get("type") != "stdio": continue
+        try:
+            c = McpClient(cfg); c.initialize()
+            tools = c.list_tools()
+            clients[name] = {"client": c, "tools": tools}
+            names = [t["name"] for t in tools]
+            all_names.extend(names)
+            print(f"  MCP [{name}]: {len(tools)} tools")
+        except Exception as e: log(f"MCP {name}", str(e))
+    return (clients if clients else None), all_names
+
+def close_mcp(clients: Optional[dict]) -> None:
+    if not clients: return
+    for _, d in clients.items():
+        c = d.get("client")
+        if c:
+            try: c.close()
+            except: pass
+
+def web_search(query: str, clients: Optional[dict]) -> Optional[str]:
+    if not clients: return None
+    for _, d in clients.items():
+        c = d.get("client")
+        if not c: continue
+        try:
+            r = c.call_tool("jina_search", {"query": query})
+            txt = "\n".join(x.get("text","") for x in r if x.get("type")=="text")[:3000]
+            if txt.strip(): return txt
+        except Exception as e: log("SEARCH", str(e))
+    return None
+
+# ═══════════════════════════════════════════════
+# Agent Tools (smolagents)
+# ═══════════════════════════════════════════════
+
+def _build_whitelist() -> set:
+    """Build flat whitelist set from config."""
+    cfg = load_config().get("agent", {}).get("bash_whitelist", {})
+    return {cmd for group in cfg.values() for cmd in group}
+
+def _blocked_patterns(cmd: str) -> bool:
+    """Check for dangerous command patterns."""
+    dangerous = ["rm -rf /", "rm -rf /*", "dd if=", "> /dev/sd", "mkfs.", ":(){ :|& };:"]
+    return any(p in cmd for p in dangerous)
+
+def build_agent_tools(internet_on: bool = False) -> list:
+    """Build tool list for smolagents CodeAgent."""
+    from smolagents import tool
+    tools = [tool(_bash_tool), tool(_write_tool), tool(_read_tool), tool(_edit_tool)]
+    if internet_on:
+        tools += [tool(_web_search_tool), tool(_web_read_tool)]
+    return tools
+
+# ═══════════════════════════════════════════════
+def _model_sublist(p, name):
+    """Build model sublist options for a provider. Returns (ids, labels)."""
+    if p.is_running():
+        ids = p.live_models()
+        cur_model = load_state().get("model", "")
+    else:
+        mlist = provider_cfg(name).get("models", [])
+        ids = [m["id"] for m in mlist]
+        cur_model = ""
+    name_map = {}
+    for m in provider_cfg(name).get("models", []):
+        name_map[m["id"]] = m.get("name", m["id"])
+    # Only show configured models, in config order
+    mopts = []
+    ids_filtered = []
+    for m in provider_cfg(name).get("models", []):
+        mid = m["id"]
+        if mid in ids:
+            ids_filtered.append(mid)
+            label = name_map.get(mid, mid)
+            if p.is_running() and mid == cur_model: label += " [running]"
+            mopts.append(label)
+    return ids_filtered, mopts
+    return ids, mopts
+
+def cmd_start(providers: Dict[str, ProviderAdapter]) -> str:
+    """Two-level picker: backend -> model."""
+    names = list(providers.keys())
+    opts = [f"  {n} [{'RUNNING' if providers[n].is_running() else 'STOPPED'}]" for n in names]
+    opts.append("Cancel")
+    idx = pick(opts, "Select backend")
+    if idx < 0 or idx >= len(names): return ""
+    name = names[idx]
+    p = providers[name]
+    ids, mopts = _model_sublist(p, name)
+    mopts = ["Start all " + name + " models"] + mopts
+    mopts.append("Cancel")
+    midx = pick(mopts, "Select model for " + name)
+    if midx < 0 or midx >= len(mopts) - 1: return ""
+    if midx == 0:
+        if not p.is_running():
+            print(p.start())
+            if not p.is_running():
+                return f"  Failed to start {name}"
+        save_state(backend=name)
+        return "  Switched: " + name
+    mid = ids[midx - 1]
+    if not p.is_running():
+        print(p.start())
+        if not p.is_running():
+            return f"  Failed to start {name}"
+    save_state(backend=name, model=mid)
+    return "  Switched: " + name + ":" + mopts[midx]
+
+def cmd_stop(providers: Dict[str, ProviderAdapter]) -> str:
+    """Two-level picker: backend -> stop all or pick model."""
+    names = list(providers.keys())
+    opts = [f"  {n} [{'RUNNING' if providers[n].is_running() else 'STOPPED'}]" for n in names]
+    opts.append("Cancel")
+    idx = pick(opts, "Select backend to stop")
+    if idx < 0 or idx >= len(names): return ""
+    name = names[idx]
+    p = providers[name]
+    if not p.is_running(): return f"  {name} not running"
+    # Show models with "Stop all" first, then individual models
+    ids = p.live_models()
+    cur_model = load_state().get("model", "")
+    mopts = ["Stop all " + name + " models"]
+    for m in provider_cfg(name).get("models", []):
+        mid = m["id"]
+        if mid in ids:
+            label = m.get("name", mid)
+            if mid == cur_model: label += " [running]"
+            mopts.append(label)
+    mopts.append("Cancel")
+    midx = pick(mopts, "Stop " + name)
+    if midx < 0 or midx >= len(mopts) - 1: return ""
+    return p.stop()
+
+
+def cmd_search(q: str, mcp: Optional[dict]) -> str:
+    if not q: return "  Usage: /search <query>"
+    if not mcp: return "  No MCP search tool."
+    print("  Searching...", end="", flush=True)
+    r = web_search(q, mcp)
+    if not r: return " failed"
+    print(" done\n")
+    for l in r.split("\n")[:15]:
+        if l.strip(): print(f"  {l.strip()[:120]}")
+    return ""
+
+def cmd_model(providers: Dict[str, ProviderAdapter]) -> str:
+    """Two-level picker: backend -> model."""
+    names = list(providers.keys())
+    opts = [f"  {n} [{'RUNNING' if providers[n].is_running() else 'STOPPED'}]" for n in names]
+    opts.append("Cancel")
+    idx = pick(opts, "Select backend")
+    if idx < 0 or idx >= len(names): return ""
+    name = names[idx]
+    p = providers[name]
+    ids, mopts = _model_sublist(p, name)
+    mopts = ["Switch to " + name] + mopts
+    mopts.append("Cancel")
+    midx = pick(mopts, "Select model for " + name)
+    if midx < 0 or midx >= len(mopts) - 1: return ""
+    if midx == 0:
+        if not p.is_running():
+            print(p.start())
+            if not p.is_running():
+                return f"  Failed to start {name}"
+        save_state(backend=name)
+        return "  Switched: " + name
+    mid = ids[midx - 1]
+    if not p.is_running():
+        print(p.start())
+        if not p.is_running():
+            return f"  Failed to start {name}"
+    save_state(backend=name, model=mid)
+    return "  Switched: " + name + ":" + mopts[midx]
+
+
+def worker_agent_panel() -> str:
+    """Show agent configuration dashboard."""
+    log("WORKER agent")
+    cfg = load_config().get("agent", {}).get("bash_whitelist", {})
+    s = load_state()
+    ag = s.get("agentic", False)
+    intr = s.get("internet", False)
+    while True:
+        opts = [
+            "  Agentic mode: " + ("ON" if ag else "OFF"),
+            "  Internet tools: " + ("ON" if intr else "OFF"),
+            "  Show allowed commands",
+            "  Return"
+        ]
+        idx = pick(opts, "Agent")
+        if idx < 0 or idx == 3: return ""
+        if idx == 0:
+            ag = not ag
+            save_state(agentic=ag)
+        elif idx == 1:
+            intr = not intr
+            save_state(internet=intr)
+        elif idx == 2:
+            total = sum(len(v) for v in cfg.values())
+            print("  Commands whitelist (" + str(total) + " total):")
+            for group, cmds in cfg.items():
+                print("    " + group + ": " + ", ".join(sorted(cmds)))
+            print("  Edit: ~/.llm_config.json agent.bash_whitelist")
+        input("  Press Enter to continue...")
+
+def cmd_settings() -> str:
+    """Interactive settings menu."""
+    s = load_state()
+    ag = s.get("agentic", False)
+    intr = s.get("internet", False)
+    while True:
+        opts = [
+            "  Agentic mode: " + ("ON" if ag else "OFF"),
+            "  Internet search: " + ("ON" if intr else "OFF"),
+            "  Return"
+        ]
+        idx = pick(opts, "Settings")
+        if idx < 0 or idx == 2: return ""
+        if idx == 0:
+            ag = not ag
+            save_state(agentic=ag)
+        elif idx == 1:
+            intr = not intr
+            save_state(internet=intr)
+        input("  Press Enter to continue...")
+
+COMMANDS = {
+    "/start":    cmd_start,
+    "/stop":     cmd_stop,
+    "/model":    cmd_model,
+    "/settings": lambda _: cmd_settings(),
+    "/agent":    lambda _: worker_agent_panel(),
+}
+HELP = """  Chat ── Core interaction. Everything else supports this.
+    wasp "query"      One-shot: respond once, then enter REPL
+    wasp             Open REPL (>>> prompt) for multi-turn
+    type message     Send to active backend (agentic or normal)
+    /exit /quit      Exit cleanly
+
+  Backends ── Enterprise setups have multiple LLMs. Switch freely.
+    /start           Pick backend -> then pick model from that backend
+    /stop            Pick backend -> confirm stop
+    /model           Pick backend -> then pick model from that backend
+
+  Agent (smolagents) ── Give the LLM tools (bash, files, web). Toggle on/off.
+    /settings        Menu: agentic ON/OFF, internet ON/OFF, credentials
+    /agent           Dashboard: status, tool whitelist
+
+  Search ── Live web results in your terminal.
+    /search <q>      Fire-and-forget search via MCP. Results inline.
+
+  Session ── Manage conversation state.
+    /new             Clear all context, start fresh
+    /help            This guide
+
+  Flags ── Control startup from the shell.
+    --list           Show configured providers and their models
+    -b <name>        Select backend on startup
+    -m <model>       Override model on startup
+
+  Examples:
+    # Quick answer, then explore
+    wasp "what is kubernetes in 3 words?"
+    >>> tell me more
+    >>> /exit
+
+    # Pick a different model mid-session
+    wasp
+    >>> /model          # arrow keys -> pick model
+    >>> explain zero-shot learning
+
+    # Agentic: LLM writes code, runs commands
+    wasp
+    >>> /settings       # turn agentic ON
+    >>> find all files larger than 10MB in /tmp
+    >>> check what ports are listening
+
+    # Search + chat
+    wasp "/search python 3.12 release date"
+    >>> what changed since 3.11?
+
+    # Pipe mode: no REPL, just answer
+    cat server.log | wasp "summarize the errors"
+    """
+
+# ═══════════════════════════════════════════════
+# Agent Functions
+# ═══════════════════════════════════════════════
+
+def run_agent_chat(messages: list, model_id: str = "", internet_on: bool = False) -> str:
+    """Run agentic chat using smolagents CodeAgent."""
+    from smolagents import CodeAgent, OpenAIModel
+    tools = build_agent_tools(internet_on)
+    model = OpenAIModel(model_id=model_id or "qwen2.5:1.5b", api_base="http://localhost:11434/v1")
+    agent = CodeAgent(tools=tools, model=model, max_steps=10, verbosity=0)
+    last = messages[-1]["content"] if messages else ""
+    log("AGENT START", last[:80])
+    result = agent.run(last)
+    log("AGENT DONE", str(result)[:80])
+    return str(result)
+
+def run_agent(task: str, internet_on: bool) -> str:
+    """Legacy: one-shot agent call."""
+    messages = [{"role": "user", "content": task}]
+    return run_agent_chat(messages, internet_on=internet_on)
+
+# ═══════════════════════════════════════════════
+# Facade — LlmCli
+# ═══════════════════════════════════════════════
+
+class LlmCli:
+    """
+    Facade: single entry point that wires everything together.
+    Parses args, initializes providers + MCP, runs the REPL.
+    """
+
+    def __init__(self) -> None:
+        self.mcp_clients: Optional[dict] = None
+        self.providers: Dict[str, ProviderAdapter] = {}
+        self.messages: List[dict] = []
+
+    # ── Bootstrap ──────────────────────────────────────────────────────────
+
+    def run(self, argv: List[str]) -> None:
+        log("START", f"args={argv[1:]}")
+
+        parser = ArgumentParser(description="wasp - Facade > Adapter > Proxy")
+        parser.add_argument("prompt", nargs="*")
+        parser.add_argument("-m", "--model")
+        parser.add_argument("-l", "--list", action="store_true")
+        parser.add_argument("-b", "--backend")
+        args = parser.parse_args(argv[1:])
+
+        # Build adapters
+        self.providers = all_adapters()
+        if not self.providers:
+            print("  No providers configured.", file=sys.stderr); sys.exit(1)
+
+        # --backend flag
+        if args.backend:
+            if args.backend not in self.providers:
+                print(f"  Unknown: {args.backend}", file=sys.stderr); sys.exit(1)
+            save_state(backend=args.backend)
+
+        # --list
+        if args.list:
+            for n, p in self.providers.items():
+                print(f"  {n}: {', '.join(p.configured_model_names())}")
+            sys.exit(0)
+
+        # Pipe mode
+        if not sys.stdin.isatty() and not args.prompt:
+            backend = active_adapter()
+            model_ids = backend.live_models() if backend else []
+            model = args.model or (model_ids[0] if model_ids else None)
+            backend.chat([{"role": "user", "content": sys.stdin.read()}], model or "")
+            sys.exit(0)
+
+        # Init MCP
+        self.mcp_clients, _ = init_mcp()
+
+        try:
+            self._repl(args)
+        finally:
+            close_mcp(self.mcp_clients)
+            log("STOP")
+
+    # ── REPL ────────────────────────────────────────────────────────────────
+
+    def _repl(self, args) -> None:
+        self.messages = [{"role": "system", "content": "You are a helpful assistant."}]
+
+        # Direct prompt → respond, then enter REPL for follow-ups
+        if args.prompt:
+            text = " ".join(args.prompt)
+            if text.startswith("/search"):
+                print(cmd_search(text[7:], self.mcp_clients))
+                return
+            self._chat_and_continue(text, args.model)
+            self._repl_loop("... ", args.model)
+            return
+
+        # Empty REPL
+        self._repl_loop(">>> ", args.model)
+
+    def _repl_loop(self, prompt: str, model: str = "") -> None:
+        """Shared REPL dispatch loop."""
+        while True:
+            line = self._read(prompt)
+            if line is None: return
+            if line in ("/exit","/quit"): return
+            if line == "/new": self.messages = []; print("  Reset."); return
+            if line == "/help": print(HELP); continue
+            if self._dispatch(line): continue
+            self._chat_and_continue(line, model)
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _read(self, prompt: str) -> Optional[str]:
+        try:
+            line = input(prompt).strip()
+            return line if line else None
+        except (EOFError, KeyboardInterrupt):
+            print(); return None
+
+    def _dispatch(self, line: str) -> bool:
+        """Try to dispatch as a command. Returns True if handled."""
+        if line.startswith("/search"):
+            print(cmd_search(line[7:], self.mcp_clients))
+            return True
+        if line in COMMANDS:
+            print(COMMANDS[line](self.providers))
+            return True
+        if line.startswith("/"):
+            print(f"  Unknown: {line}")
+            return True
+        return False
+
+    def _chat_and_continue(self, text: str, model: str = "") -> None:
+        self.messages.append({"role": "user", "content": text})
+        s = load_state()
+        if s.get("agentic", False):
+            result = run_agent_chat(self.messages, model, s.get("internet", False))
+            print("\n  " + result)
+            self.messages.append({"role": "assistant", "content": result})
+            return
+        adapter = active_adapter()
+        if not adapter:
+            print("  No backend.", file=sys.stderr); return
+        resp = adapter.chat(self.messages, model)
+        # Save assistant response if we got one back
+        if resp:
+            self.messages.append({"role": "assistant", "content": resp})
+
+
+# ═══════════════════════════════════════════════
+# Entry
+# ═══════════════════════════════════════════════
+
+def main() -> None:
+    LlmCli().run(sys.argv)
+
+if __name__ == "__main__":
+    main()

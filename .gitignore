@@ -1,0 +1,8 @@
+*.log
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.bak
+~/.llm_secrets
+~/.llm_state.json
